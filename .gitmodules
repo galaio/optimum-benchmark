@@ -1,0 +1,3 @@
+[submodule "optimum-dev-setup-guide"]
+	path = optimum-dev-setup-guide
+	url = https://github.com/getoptimum/optimum-dev-setup-guide.git

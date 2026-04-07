@@ -1,0 +1,9 @@
+.venv/
+results/
+*.tsv
+identity/
+.env
+__pycache__/
+*.pyc
+tools/libp2p-direct/bench-direct
+tools/libp2p-direct/go.sum

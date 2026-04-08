@@ -175,8 +175,28 @@ def apply_network_shaping(
               f"Latency simulation will not take effect.{NC}")
         print(f"  {YELLOW}Check that the host kernel has sch_netem loaded: "
               f"modprobe sch_netem{NC}")
-    else:
-        print(f"  Network shaping applied to {success}/{n_nodes} nodes\n")
+        return
+
+    print(f"  Network shaping applied to {success}/{n_nodes} nodes")
+
+    # Verify: show actual qdisc on one node and run a ping test
+    verify_container = f"{project_name}-p2pnode-1-1"
+    qdisc_result = subprocess.run(
+        ["docker", "exec", verify_container, "tc", "qdisc", "show", "dev", "eth0"],
+        capture_output=True, text=True,
+    )
+    print(f"  Verify qdisc on p2pnode-1: {qdisc_result.stdout.strip()}")
+
+    if n_nodes >= 2:
+        target_ip = f"172.28.0.{13}"  # p2pnode-2
+        ping_result = subprocess.run(
+            ["docker", "exec", verify_container, "sh", "-c",
+             f"apk add --no-cache iputils > /dev/null 2>&1; "
+             f"ping -c 3 -W 5 {target_ip} 2>&1 | tail -1"],
+            capture_output=True, text=True, timeout=30,
+        )
+        print(f"  Ping p2pnode-1 → p2pnode-2: {ping_result.stdout.strip()}")
+    print()
 
 
 def docker_compose_down(compose_file: str, project_name: str):

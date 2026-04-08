@@ -12,10 +12,22 @@ Sender → gRPC → Node-1 sidecar → gossip mesh → Node-2..8 → gRPC → Su
 
 ## Prerequisites
 
+> **Linux only** — This benchmark relies on `tc netem` for network latency simulation, which requires the Linux kernel. macOS Docker Desktop and Windows WSL2 do not reliably support `tc` inside containers. Always run on a native Linux host for accurate results.
+
+- **OS**: Linux (Ubuntu, CentOS, Amazon Linux, etc.)
 - Docker & Docker Compose
 - Go 1.22+
 - Python 3.10+
 - `pip install -r requirements.txt`
+- `tc` and `nsenter` on the host (for network shaping):
+
+```bash
+# RHEL / CentOS / Amazon Linux
+sudo yum install -y iproute iproute-tc util-linux
+
+# Debian / Ubuntu
+sudo apt install -y iproute2 util-linux
+```
 
 ## Quick Start
 
@@ -25,7 +37,7 @@ cd scripts
 # 3-way comparison (auto setup → start → run → stop → clean)
 python3 benchmark.py --mode compare
 
-# With WAN latency simulation (Linux only, see Known Issues #9)
+# With WAN latency simulation (Linux only — requires tc + nsenter, see Known Issues #9)
 python3 benchmark.py --mode compare --latency wan
 
 # 20-node, custom latency + bandwidth
@@ -66,7 +78,9 @@ bash run_direct_bench.sh 8 102400 10 500 /tmp/direct.tsv
 | **GossipSub** | Earliest `DELIVER_MESSAGE` | Inter-node propagation spread (first → last receiver) |
 | **libp2p Direct** | In-process `time.Now()` | Pure TCP stream write → read |
 
-## Benchmark Results (Local Docker, 100KB, 8 nodes)
+## Benchmark Results (100KB, 8 nodes)
+
+**Without latency (Local Docker bridge, ~0ms RTT):**
 
 | Protocol | Avg Latency | Min | Max | Measurement |
 |----------|------------|-----|-----|-------------|
@@ -74,8 +88,17 @@ bash run_direct_bench.sh 8 102400 10 500 /tmp/direct.tsv
 | **GossipSub** | **~42ms** | 0ms | ~142ms | Inter-node spread (first→last deliver) |
 | **mump2p (RLNC)** | **~94ms** | ~43ms | ~181ms | Shard encode → propagate → decode |
 
-> Local Docker bridge has ~0ms RTT. GossipSub is faster than mump2p because store-and-forward has no encoding overhead.
-> The ~52ms delta in mump2p comes from RLNC encoding/decoding CPU cost, which is offset by multi-path/loss-resilience advantages in high-latency WAN environments.
+> Without latency, GossipSub is faster than mump2p because store-and-forward has no encoding overhead.
+
+**With WAN latency (`--latency wan`, Linux host):**
+
+| Protocol | Avg Latency | Min | Max | Measurement |
+|----------|------------|-----|-----|-------------|
+| **libp2p Direct** | **~1ms** | ~0.4ms | ~4ms | Local TCP (unaffected by tc netem) |
+| **GossipSub** | **~261ms** | ~261ms | ~261ms | Propagation spread across mesh |
+| **mump2p (RLNC)** | **~234ms** | **~201ms** | ~261ms | RLNC coded fragment spread |
+
+> With WAN latency, **mump2p (RLNC) is ~10% faster on average and ~23% faster in best case** than GossipSub. RLNC can reconstruct from any k-of-n coded fragments, exploiting faster paths instead of waiting for the slowest hop. GossipSub must forward the complete message through the mesh, bottlenecked by the highest-latency node on the path.
 
 **Latency Breakdown (100KB message):**
 
@@ -104,7 +127,8 @@ mump2p (RLNC):  [encode ~20ms] → [shard propagation ~30ms] → [decode + sprea
 | Dimension | libp2p Direct | GossipSub | mump2p (RLNC) |
 |-----------|--------------|-----------|----------------|
 | Propagation model | Point-to-point stream | Store-and-forward (full message) | Shard-and-recode (coded fragments) |
-| Local Docker latency | ~1ms | ~42ms | ~94ms |
+| Local Docker (no latency) | ~1ms | ~42ms | ~94ms |
+| WAN latency simulation | ~1ms (local) | ~261ms | **~234ms (10% faster)** |
 | Hoodi testnet (30 nodes) | — | ~1000ms | ~150ms (6.7x faster) |
 | Intermediate node | N/A | Forward complete msg only | Recode partial shards |
 | Packet loss resilience | None | Full retransmission | Any k independent shards suffice |
@@ -156,11 +180,19 @@ The first message in each phase suffers from incomplete topic subscription GRAFT
 ### 8. Large message + WAN latency combination failure
 900KB messages work fine without latency, but adding `--latency wan` causes GossipSub/mump2p to receive nothing. Likely due to internal gossip protocol message propagation timeouts being exceeded by the large message + high latency combination. **Use `--msg-size 100kb` for WAN tests**.
 
-### 9. macOS Docker Desktop does not support `tc netem` latency simulation
-`--latency` relies on the Linux kernel's `tc netem` (traffic control) to inject network delay inside containers. On macOS Docker Desktop, the `getoptimum/p2pnode` image is amd64-only and runs via Rosetta emulation, where the `rtnetlink` kernel interface required by `tc qdisc` is not supported (`Cannot talk to rtnetlink: Not supported`).
+### 9. Network latency simulation requires a native Linux host
+`--latency` relies on the Linux kernel's `tc netem` (traffic control) to inject network delay into container network namespaces via `nsenter`. This does **not** work on:
+- **macOS Docker Desktop** — amd64 images run via Rosetta emulation; `rtnetlink` is unsupported (`Cannot talk to rtnetlink: Not supported`)
+- **Windows Docker Desktop / WSL2** — the WSL2 kernel may lack `sch_netem` module and `nsenter` cannot access container network namespaces through the VM boundary
 
-**Symptom**: Results with `--latency wan` are identical to `--latency off` — delay is not applied.
+**Symptom**: Results with `--latency wan` are identical to `--latency off` — delay is silently not applied.
 
-**Workaround**:
-- The benchmark automatically detects `tc` support at startup and prints a warning when unavailable, skipping delay injection
-- For real network latency simulation, run on a **Linux host**
+**Solution**: Always run on a **native Linux host**. Ensure `tc` and `nsenter` are installed:
+```bash
+# RHEL / CentOS / Amazon Linux
+sudo yum install -y iproute iproute-tc util-linux
+
+# Debian / Ubuntu
+sudo apt install -y iproute2 util-linux
+```
+The benchmark uses the host's `tc` binary via `nsenter` (searching `/sbin/tc`, `/usr/sbin/tc`) to avoid version mismatches between container iproute2 and the host kernel. If `tc` or `nsenter` is missing, it falls back to the container's `tc` which may silently fail.

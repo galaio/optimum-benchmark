@@ -50,19 +50,96 @@ DEFAULT_MSG_SIZE = "100kb"
 DEFAULT_COUNT = 10
 DEFAULT_BANDWIDTH = 10000
 
+P2PNODE_IMAGE = "getoptimum/p2pnode:v0.0.1-rc16"
+
 YELLOW = "\033[1;33m"
 NC = "\033[0m"
 
+_TC_SBIN_PATHS = ["/sbin/tc", "/usr/sbin/tc", "/usr/local/sbin/tc"]
+_NSENTER_PATHS = ["/usr/bin/nsenter", "/usr/sbin/nsenter", "/sbin/nsenter"]
+
+
+def _find_bin(name: str, extra_paths: list[str] | None = None) -> str | None:
+    """Find an executable by name, checking PATH and common sbin directories."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for p in (extra_paths or []):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _image_has_tc(image: str = P2PNODE_IMAGE) -> bool:
+    """Check whether a Docker image already contains the tc binary."""
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint=",
+         image, "sh", "-c", "command -v tc"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return r.returncode == 0 and r.stdout.strip() != ""
+
 
 def check_tc_support() -> bool:
-    """Detect whether tc netem works inside Docker containers on this host."""
+    """Detect whether tc netem works inside Docker containers on this host.
+
+    First tries the host tc + nsenter approach (most reliable on Linux).
+    Falls back to testing the container's own tc.
+    """
+    tc_path = _find_bin("tc", _TC_SBIN_PATHS)
+    nsenter_path = _find_bin("nsenter", _NSENTER_PATHS)
+
+    # Strategy 1: nsenter + host tc  (does NOT need tc inside the container)
+    if tc_path and nsenter_path:
+        try:
+            run_result = subprocess.run(
+                ["docker", "run", "-d", "--rm", "--cap-add", "NET_ADMIN",
+                 P2PNODE_IMAGE, "sleep", "30"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if run_result.returncode != 0:
+                return False
+            cid = run_result.stdout.strip()
+            try:
+                pid_r = subprocess.run(
+                    ["docker", "inspect", "-f", "{{.State.Pid}}", cid],
+                    capture_output=True, text=True, timeout=10,
+                )
+                pid = pid_r.stdout.strip()
+                subprocess.run(["modprobe", "sch_netem"],
+                               capture_output=True, timeout=10)
+                tc_r = subprocess.run(
+                    [nsenter_path, "-t", pid, "-n", tc_path,
+                     "qdisc", "add", "dev", "eth0", "root", "netem", "delay", "1ms"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                output = tc_r.stdout + tc_r.stderr
+                if tc_r.returncode == 0 and "Not supported" not in output:
+                    return True
+            finally:
+                subprocess.run(["docker", "rm", "-f", cid],
+                               capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+    # Strategy 2: docker exec + container tc  (needs tc in the image)
+    has_tc = False
+    try:
+        has_tc = _image_has_tc()
+    except Exception:
+        pass
+
+    install_cmd = ""
+    if not has_tc:
+        install_cmd = "apk add --no-cache iproute2 > /dev/null 2>&1 && "
+
     try:
         result = subprocess.run(
             [
                 "docker", "run", "--rm", "--cap-add", "NET_ADMIN",
-                "--entrypoint=", "getoptimum/p2pnode:v0.0.1-rc16",
+                "--entrypoint=", P2PNODE_IMAGE,
                 "sh", "-c",
-                "apk add --no-cache iproute2 > /dev/null 2>&1 && "
+                f"{install_cmd}"
                 "tc qdisc add dev eth0 root netem delay 1ms 2>&1",
             ],
             capture_output=True, text=True, timeout=120,
@@ -142,20 +219,23 @@ def _get_container_pid(container: str) -> str | None:
     return pid if result.returncode == 0 and pid and pid != "0" else None
 
 
-def _apply_tc_via_nsenter(container: str, lat: int | None, bandwidth_mbit: int | None) -> bool:
+def _apply_tc_via_nsenter(
+    container: str, lat: int | None, bandwidth_mbit: int | None,
+    nsenter_bin: str = "nsenter", tc_bin: str = "tc",
+) -> bool:
     """Apply tc rules using host's tc via nsenter into container's network namespace."""
     pid = _get_container_pid(container)
     if not pid:
         return False
 
-    tc_cmd = ["nsenter", "-t", pid, "-n", "tc", "qdisc", "add", "dev", "eth0", "root"]
+    base = [nsenter_bin, "-t", pid, "-n", tc_bin]
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
         cmds = [
-            ["nsenter", "-t", pid, "-n", "tc", "qdisc", "add", "dev", "eth0",
-             "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
-            ["nsenter", "-t", pid, "-n", "tc", "qdisc", "add", "dev", "eth0",
-             "parent", "1:1", "handle", "10:", "tbf",
-             "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"],
+            base + ["qdisc", "add", "dev", "eth0",
+                    "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
+            base + ["qdisc", "add", "dev", "eth0",
+                    "parent", "1:1", "handle", "10:", "tbf",
+                    "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"],
         ]
         for cmd in cmds:
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -163,26 +243,52 @@ def _apply_tc_via_nsenter(container: str, lat: int | None, bandwidth_mbit: int |
                 return False
         return True
     elif lat and lat > 0:
-        tc_cmd += ["netem", "delay", f"{lat}ms"]
+        cmd = base + ["qdisc", "add", "dev", "eth0", "root", "netem", "delay", f"{lat}ms"]
     elif bandwidth_mbit and bandwidth_mbit > 0:
-        tc_cmd += ["tbf", "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"]
+        cmd = base + ["qdisc", "add", "dev", "eth0", "root", "tbf",
+                      "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"]
     else:
         return True
 
-    r = subprocess.run(tc_cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0
+
+
+def _container_has_tc(container: str) -> bool:
+    """Check whether a running container already has tc installed."""
+    r = subprocess.run(
+        ["docker", "exec", container, "sh", "-c", "command -v tc"],
+        capture_output=True, text=True, timeout=10,
+    )
+    return r.returncode == 0 and r.stdout.strip() != ""
 
 
 def _apply_tc_via_docker_exec(container: str, lat: int | None, bandwidth_mbit: int | None) -> bool:
     """Fallback: apply tc rules inside the container using its own tc binary."""
-    tc_cmds = "apk add --no-cache iproute2 > /dev/null 2>&1"
+    if not _container_has_tc(container):
+        install = subprocess.run(
+            ["docker", "exec", container, "sh", "-c",
+             "apk add --no-cache iproute2 > /dev/null 2>&1"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if install.returncode != 0 or not _container_has_tc(container):
+            return False
+
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
-        tc_cmds += f" && tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
-        tc_cmds += f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+        tc_cmds = (
+            f"tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
+            f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf"
+            f" rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+        )
     elif lat and lat > 0:
-        tc_cmds += f" && tc qdisc add dev eth0 root netem delay {lat}ms"
+        tc_cmds = f"tc qdisc add dev eth0 root netem delay {lat}ms"
     elif bandwidth_mbit and bandwidth_mbit > 0:
-        tc_cmds += f" && tc qdisc add dev eth0 root tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+        tc_cmds = (
+            f"tc qdisc add dev eth0 root tbf"
+            f" rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+        )
+    else:
+        return True
 
     r = subprocess.run(
         ["docker", "exec", container, "sh", "-c", tc_cmds],
@@ -208,15 +314,15 @@ def apply_network_shaping(
     print(f"\n  Applying network shaping (tc netem)...")
     _ensure_sch_netem()
 
-    host_has_tc = subprocess.run(
-        ["which", "tc"], capture_output=True
-    ).returncode == 0
-    use_nsenter = host_has_tc and shutil.which("nsenter") is not None
+    tc_path = _find_bin("tc", _TC_SBIN_PATHS)
+    nsenter_path = _find_bin("nsenter", _NSENTER_PATHS)
+    use_nsenter = tc_path is not None and nsenter_path is not None
 
     if use_nsenter:
-        print("  Strategy: nsenter + host tc (avoids container/kernel version mismatch)")
+        print(f"  Strategy: nsenter + host tc ({tc_path}, {nsenter_path})")
     else:
-        print("  Strategy: docker exec + container tc (nsenter or host tc not available)")
+        print(f"  Strategy: docker exec + container tc "
+              f"(host tc={tc_path}, nsenter={nsenter_path})")
 
     success = 0
     for i in range(n_nodes):
@@ -230,7 +336,8 @@ def apply_network_shaping(
             continue
 
         if use_nsenter:
-            ok = _apply_tc_via_nsenter(container, lat, bandwidth_mbit)
+            ok = _apply_tc_via_nsenter(container, lat, bandwidth_mbit,
+                                          nsenter_bin=nsenter_path, tc_bin=tc_path)
         else:
             ok = _apply_tc_via_docker_exec(container, lat, bandwidth_mbit)
 
@@ -249,12 +356,11 @@ def apply_network_shaping(
 
     print(f"  Network shaping applied to {success}/{n_nodes} nodes")
 
-    # Verify via nsenter (host tc) to avoid the same version mismatch in show
     first_container = f"{project_name}-p2pnode-1-1"
     pid = _get_container_pid(first_container)
-    if pid:
+    if use_nsenter and pid:
         qdisc_result = subprocess.run(
-            ["nsenter", "-t", pid, "-n", "tc", "qdisc", "show", "dev", "eth0"],
+            [nsenter_path, "-t", pid, "-n", tc_path, "qdisc", "show", "dev", "eth0"],
             capture_output=True, text=True,
         )
         qdisc_out = qdisc_result.stdout.strip()

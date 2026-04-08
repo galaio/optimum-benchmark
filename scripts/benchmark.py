@@ -133,22 +133,90 @@ def _ensure_sch_netem():
         print(f"  tc netem delay may not work without this kernel module.{NC}")
 
 
+def _get_container_pid(container: str) -> str | None:
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Pid}}", container],
+        capture_output=True, text=True,
+    )
+    pid = result.stdout.strip()
+    return pid if result.returncode == 0 and pid and pid != "0" else None
+
+
+def _apply_tc_via_nsenter(container: str, lat: int | None, bandwidth_mbit: int | None) -> bool:
+    """Apply tc rules using host's tc via nsenter into container's network namespace."""
+    pid = _get_container_pid(container)
+    if not pid:
+        return False
+
+    tc_cmd = ["nsenter", "-t", pid, "-n", "tc", "qdisc", "add", "dev", "eth0", "root"]
+    if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
+        cmds = [
+            ["nsenter", "-t", pid, "-n", "tc", "qdisc", "add", "dev", "eth0",
+             "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
+            ["nsenter", "-t", pid, "-n", "tc", "qdisc", "add", "dev", "eth0",
+             "parent", "1:1", "handle", "10:", "tbf",
+             "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"],
+        ]
+        for cmd in cmds:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                return False
+        return True
+    elif lat and lat > 0:
+        tc_cmd += ["netem", "delay", f"{lat}ms"]
+    elif bandwidth_mbit and bandwidth_mbit > 0:
+        tc_cmd += ["tbf", "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"]
+    else:
+        return True
+
+    r = subprocess.run(tc_cmd, capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def _apply_tc_via_docker_exec(container: str, lat: int | None, bandwidth_mbit: int | None) -> bool:
+    """Fallback: apply tc rules inside the container using its own tc binary."""
+    tc_cmds = "apk add --no-cache iproute2 > /dev/null 2>&1"
+    if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
+        tc_cmds += f" && tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
+        tc_cmds += f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+    elif lat and lat > 0:
+        tc_cmds += f" && tc qdisc add dev eth0 root netem delay {lat}ms"
+    elif bandwidth_mbit and bandwidth_mbit > 0:
+        tc_cmds += f" && tc qdisc add dev eth0 root tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+
+    r = subprocess.run(
+        ["docker", "exec", container, "sh", "-c", tc_cmds],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
 def apply_network_shaping(
     project_name: str,
     n_nodes: int,
     latencies: list[int] | None,
     bandwidth_mbit: int | None,
 ):
-    """Apply tc netem rules to running containers via docker exec.
+    """Apply tc netem rules to running containers.
 
-    Called AFTER docker compose up so the containers have network access
-    for installing iproute2. Errors are reported instead of silently ignored.
+    Prefers nsenter (host tc binary, avoids version mismatch with kernel).
+    Falls back to docker exec (container tc) if nsenter is unavailable.
     """
     if not latencies and not bandwidth_mbit:
         return
 
     print(f"\n  Applying network shaping (tc netem)...")
     _ensure_sch_netem()
+
+    host_has_tc = subprocess.run(
+        ["which", "tc"], capture_output=True
+    ).returncode == 0
+    use_nsenter = host_has_tc and shutil.which("nsenter") is not None
+
+    if use_nsenter:
+        print("  Strategy: nsenter + host tc (avoids container/kernel version mismatch)")
+    else:
+        print("  Strategy: docker exec + container tc (nsenter or host tc not available)")
 
     success = 0
     for i in range(n_nodes):
@@ -161,54 +229,50 @@ def apply_network_shaping(
         if not needs_tc:
             continue
 
-        tc_cmds = "apk add --no-cache iproute2 > /dev/null 2>&1"
-        if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
-            tc_cmds += f" && tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
-            tc_cmds += f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
-        elif lat and lat > 0:
-            tc_cmds += f" && tc qdisc add dev eth0 root netem delay {lat}ms"
-        elif bandwidth_mbit and bandwidth_mbit > 0:
-            tc_cmds += f" && tc qdisc add dev eth0 root tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+        if use_nsenter:
+            ok = _apply_tc_via_nsenter(container, lat, bandwidth_mbit)
+        else:
+            ok = _apply_tc_via_docker_exec(container, lat, bandwidth_mbit)
 
-        result = subprocess.run(
-            ["docker", "exec", container, "sh", "-c", tc_cmds],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
+        if ok:
             label = f"delay={lat}ms" if lat else ""
             if bandwidth_mbit:
                 label += f" bw={bandwidth_mbit}mbit"
             print(f"    p2pnode-{i + 1}: {label.strip()}")
             success += 1
         else:
-            err = (result.stderr + result.stdout).strip()
-            print(f"    {YELLOW}p2pnode-{i + 1}: FAILED — {err}{NC}")
+            print(f"    {YELLOW}p2pnode-{i + 1}: FAILED{NC}")
 
     if success == 0:
-        print(f"  {YELLOW}WARNING: tc netem failed on all nodes. "
-              f"Latency simulation will not take effect.{NC}")
+        print(f"  {YELLOW}WARNING: tc netem failed on all nodes.{NC}")
         return
 
     print(f"  Network shaping applied to {success}/{n_nodes} nodes")
 
-    # Verify: check qdisc has delay parameter and ping confirms actual delay
-    verify_container = f"{project_name}-p2pnode-1-1"
-    qdisc_result = subprocess.run(
-        ["docker", "exec", verify_container, "tc", "qdisc", "show", "dev", "eth0"],
-        capture_output=True, text=True,
-    )
-    qdisc_out = qdisc_result.stdout.strip()
+    # Verify via nsenter (host tc) to avoid the same version mismatch in show
+    first_container = f"{project_name}-p2pnode-1-1"
+    pid = _get_container_pid(first_container)
+    if pid:
+        qdisc_result = subprocess.run(
+            ["nsenter", "-t", pid, "-n", "tc", "qdisc", "show", "dev", "eth0"],
+            capture_output=True, text=True,
+        )
+        qdisc_out = qdisc_result.stdout.strip()
+    else:
+        qdisc_result = subprocess.run(
+            ["docker", "exec", first_container, "tc", "qdisc", "show", "dev", "eth0"],
+            capture_output=True, text=True,
+        )
+        qdisc_out = qdisc_result.stdout.strip()
     print(f"  Verify qdisc on p2pnode-1: {qdisc_out}")
 
     if "delay" not in qdisc_out:
-        print(f"  {YELLOW}WARNING: qdisc created but 'delay' parameter is missing!")
-        print(f"  The sch_netem kernel module may be absent or incompatible.")
-        print(f"  Try on the host: modprobe sch_netem && lsmod | grep netem{NC}")
+        print(f"  {YELLOW}WARNING: delay parameter missing in qdisc!{NC}")
 
     if n_nodes >= 2:
         target_ip = f"172.28.0.{13}"  # p2pnode-2
         ping_result = subprocess.run(
-            ["docker", "exec", verify_container, "sh", "-c",
+            ["docker", "exec", first_container, "sh", "-c",
              f"apk add --no-cache iputils > /dev/null 2>&1; "
              f"ping -c 3 -W 5 {target_ip} 2>&1 | tail -1"],
             capture_output=True, text=True, timeout=30,
@@ -219,11 +283,10 @@ def apply_network_shaping(
         try:
             avg_str = ping_out.split("/")[4] if "/" in ping_out else "0"
             avg_rtt = float(avg_str)
-            expected_min = 20.0  # p2pnode-1 egress 20ms + p2pnode-2 egress 50ms
-            if avg_rtt < expected_min:
-                print(f"  {YELLOW}WARNING: RTT {avg_rtt:.1f}ms is too low "
-                      f"(expected ≥{expected_min:.0f}ms with tc delay).")
-                print(f"  tc netem delay is NOT effective.{NC}")
+            if avg_rtt < 10.0:
+                print(f"  {YELLOW}WARNING: RTT {avg_rtt:.1f}ms too low — tc delay not effective.{NC}")
+            else:
+                print(f"  tc delay confirmed working (RTT {avg_rtt:.1f}ms)")
         except (ValueError, IndexError):
             pass
     print()

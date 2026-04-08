@@ -219,6 +219,17 @@ def _get_container_pid(container: str) -> str | None:
     return pid if result.returncode == 0 and pid and pid != "0" else None
 
 
+def _run_tc_cmd(cmd: list[str], label: str = "") -> bool:
+    """Run a tc command, print stderr on failure, return success."""
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        err = (r.stderr + r.stdout).strip()
+        prefix = f"    [{label}] " if label else "    "
+        print(f"{prefix}{YELLOW}tc failed (rc={r.returncode}): {err}{NC}")
+        return False
+    return True
+
+
 def _apply_tc_via_nsenter(
     container: str, lat: int | None, bandwidth_mbit: int | None,
     nsenter_bin: str = "nsenter", tc_bin: str = "tc",
@@ -226,22 +237,23 @@ def _apply_tc_via_nsenter(
     """Apply tc rules using host's tc via nsenter into container's network namespace."""
     pid = _get_container_pid(container)
     if not pid:
+        print(f"    {YELLOW}Cannot get PID for {container}{NC}")
         return False
 
     base = [nsenter_bin, "-t", pid, "-n", tc_bin]
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
-        cmds = [
+        if not _run_tc_cmd(
             base + ["qdisc", "add", "dev", "eth0",
                     "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
+            container,
+        ):
+            return False
+        return _run_tc_cmd(
             base + ["qdisc", "add", "dev", "eth0",
                     "parent", "1:1", "handle", "10:", "tbf",
                     "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"],
-        ]
-        for cmd in cmds:
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                return False
-        return True
+            container,
+        )
     elif lat and lat > 0:
         cmd = base + ["qdisc", "add", "dev", "eth0", "root", "netem", "delay", f"{lat}ms"]
     elif bandwidth_mbit and bandwidth_mbit > 0:
@@ -250,8 +262,7 @@ def _apply_tc_via_nsenter(
     else:
         return True
 
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0
+    return _run_tc_cmd(cmd, container)
 
 
 def _container_has_tc(container: str) -> bool:
@@ -268,10 +279,15 @@ def _apply_tc_via_docker_exec(container: str, lat: int | None, bandwidth_mbit: i
     if not _container_has_tc(container):
         install = subprocess.run(
             ["docker", "exec", container, "sh", "-c",
-             "apk add --no-cache iproute2 > /dev/null 2>&1"],
+             "apk add --no-cache iproute2 2>&1"],
             capture_output=True, text=True, timeout=60,
         )
-        if install.returncode != 0 or not _container_has_tc(container):
+        if install.returncode != 0:
+            print(f"    {YELLOW}apk add iproute2 failed in {container}: "
+                  f"{install.stderr.strip()}{NC}")
+            return False
+        if not _container_has_tc(container):
+            print(f"    {YELLOW}tc still missing after iproute2 install in {container}{NC}")
             return False
 
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
@@ -291,10 +307,24 @@ def _apply_tc_via_docker_exec(container: str, lat: int | None, bandwidth_mbit: i
         return True
 
     r = subprocess.run(
-        ["docker", "exec", container, "sh", "-c", tc_cmds],
+        ["docker", "exec", container, "sh", "-c", tc_cmds + " 2>&1"],
         capture_output=True, text=True,
     )
-    return r.returncode == 0
+    if r.returncode != 0:
+        err = (r.stdout + r.stderr).strip()
+        print(f"    {YELLOW}docker exec tc failed in {container} (rc={r.returncode}): {err}{NC}")
+        return False
+
+    verify = subprocess.run(
+        ["docker", "exec", container, "tc", "qdisc", "show", "dev", "eth0"],
+        capture_output=True, text=True,
+    )
+    if lat and lat > 0 and "delay" not in verify.stdout:
+        print(f"    {YELLOW}tc returned 0 but delay not in qdisc for {container}: "
+              f"{verify.stdout.strip()}{NC}")
+        return False
+
+    return True
 
 
 def apply_network_shaping(
@@ -321,8 +351,17 @@ def apply_network_shaping(
     if use_nsenter:
         print(f"  Strategy: nsenter + host tc ({tc_path}, {nsenter_path})")
     else:
+        missing = []
+        if not tc_path:
+            missing.append("tc")
+        if not nsenter_path:
+            missing.append("nsenter")
         print(f"  Strategy: docker exec + container tc "
-              f"(host tc={tc_path}, nsenter={nsenter_path})")
+              f"(host missing: {', '.join(missing) if missing else 'none'})")
+        print(f"  {YELLOW}TIP: Install iproute2 on the host for reliable tc netem:")
+        print(f"    RHEL/CentOS/Amazon Linux: yum install -y iproute iproute-tc")
+        print(f"    Debian/Ubuntu:            apt install -y iproute2")
+        print(f"    Alpine:                   apk add iproute2{NC}")
 
     success = 0
     for i in range(n_nodes):
@@ -341,10 +380,23 @@ def apply_network_shaping(
         else:
             ok = _apply_tc_via_docker_exec(container, lat, bandwidth_mbit)
 
+        label = f"delay={lat}ms" if lat else ""
+        if bandwidth_mbit:
+            label += f" bw={bandwidth_mbit}mbit"
+
+        if ok and use_nsenter and lat and lat > 0:
+            pid = _get_container_pid(container)
+            if pid:
+                v = subprocess.run(
+                    [nsenter_path, "-t", pid, "-n", tc_path, "qdisc", "show", "dev", "eth0"],
+                    capture_output=True, text=True,
+                )
+                if "delay" not in v.stdout:
+                    print(f"    {YELLOW}p2pnode-{i + 1}: tc returned 0 but qdisc has no delay "
+                          f"[{v.stdout.strip()}]{NC}")
+                    ok = False
+
         if ok:
-            label = f"delay={lat}ms" if lat else ""
-            if bandwidth_mbit:
-                label += f" bw={bandwidth_mbit}mbit"
             print(f"    p2pnode-{i + 1}: {label.strip()}")
             success += 1
         else:

@@ -120,6 +120,19 @@ def docker_compose_up(compose_file: str, project_name: str):
     )
 
 
+def _ensure_sch_netem():
+    """Try to load the sch_netem kernel module on the host (requires root)."""
+    result = subprocess.run(
+        ["modprobe", "sch_netem"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print("  Loaded kernel module: sch_netem")
+    else:
+        print(f"  {YELLOW}modprobe sch_netem failed: {result.stderr.strip()}")
+        print(f"  tc netem delay may not work without this kernel module.{NC}")
+
+
 def apply_network_shaping(
     project_name: str,
     n_nodes: int,
@@ -135,8 +148,9 @@ def apply_network_shaping(
         return
 
     print(f"\n  Applying network shaping (tc netem)...")
-    success = 0
+    _ensure_sch_netem()
 
+    success = 0
     for i in range(n_nodes):
         container = f"{project_name}-p2pnode-{i + 1}-1"
         lat = latencies[i % len(latencies)] if latencies else None
@@ -173,19 +187,23 @@ def apply_network_shaping(
     if success == 0:
         print(f"  {YELLOW}WARNING: tc netem failed on all nodes. "
               f"Latency simulation will not take effect.{NC}")
-        print(f"  {YELLOW}Check that the host kernel has sch_netem loaded: "
-              f"modprobe sch_netem{NC}")
         return
 
     print(f"  Network shaping applied to {success}/{n_nodes} nodes")
 
-    # Verify: show actual qdisc on one node and run a ping test
+    # Verify: check qdisc has delay parameter and ping confirms actual delay
     verify_container = f"{project_name}-p2pnode-1-1"
     qdisc_result = subprocess.run(
         ["docker", "exec", verify_container, "tc", "qdisc", "show", "dev", "eth0"],
         capture_output=True, text=True,
     )
-    print(f"  Verify qdisc on p2pnode-1: {qdisc_result.stdout.strip()}")
+    qdisc_out = qdisc_result.stdout.strip()
+    print(f"  Verify qdisc on p2pnode-1: {qdisc_out}")
+
+    if "delay" not in qdisc_out:
+        print(f"  {YELLOW}WARNING: qdisc created but 'delay' parameter is missing!")
+        print(f"  The sch_netem kernel module may be absent or incompatible.")
+        print(f"  Try on the host: modprobe sch_netem && lsmod | grep netem{NC}")
 
     if n_nodes >= 2:
         target_ip = f"172.28.0.{13}"  # p2pnode-2
@@ -195,7 +213,19 @@ def apply_network_shaping(
              f"ping -c 3 -W 5 {target_ip} 2>&1 | tail -1"],
             capture_output=True, text=True, timeout=30,
         )
-        print(f"  Ping p2pnode-1 → p2pnode-2: {ping_result.stdout.strip()}")
+        ping_out = ping_result.stdout.strip()
+        print(f"  Ping p2pnode-1 → p2pnode-2: {ping_out}")
+
+        try:
+            avg_str = ping_out.split("/")[4] if "/" in ping_out else "0"
+            avg_rtt = float(avg_str)
+            expected_min = 20.0  # p2pnode-1 egress 20ms + p2pnode-2 egress 50ms
+            if avg_rtt < expected_min:
+                print(f"  {YELLOW}WARNING: RTT {avg_rtt:.1f}ms is too low "
+                      f"(expected ≥{expected_min:.0f}ms with tc delay).")
+                print(f"  tc netem delay is NOT effective.{NC}")
+        except (ValueError, IndexError):
+            pass
     print()
 
 

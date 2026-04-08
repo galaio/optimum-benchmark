@@ -56,23 +56,23 @@ NC = "\033[0m"
 
 def check_tc_support() -> bool:
     """Detect whether tc netem works inside Docker containers on this host."""
-    if platform.system() == "Darwin":
-        try:
-            result = subprocess.run(
-                [
-                    "docker", "run", "--rm", "--cap-add", "NET_ADMIN",
-                    "--entrypoint=", "getoptimum/p2pnode:v0.0.1-rc16",
-                    "sh", "-c",
-                    "apk add --no-cache iproute2 > /dev/null 2>&1; "
-                    "tc qdisc add dev eth0 root netem delay 1ms 2>&1",
-                ],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode != 0 or "Not supported" in result.stdout + result.stderr:
-                return False
-        except Exception:
+    try:
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm", "--cap-add", "NET_ADMIN",
+                "--entrypoint=", "getoptimum/p2pnode:v0.0.1-rc16",
+                "sh", "-c",
+                "apk add --no-cache iproute2 > /dev/null 2>&1 && "
+                "tc qdisc add dev eth0 root netem delay 1ms 2>&1",
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        output = result.stdout + result.stderr
+        if result.returncode != 0 or "Not supported" in output:
             return False
-    return True
+        return True
+    except Exception:
+        return False
 
 
 def parse_msg_size(s: str) -> int:
@@ -118,6 +118,65 @@ def docker_compose_up(compose_file: str, project_name: str):
         ["docker", "compose", "-f", compose_file, "-p", project_name, "up", "-d"],
         check=True,
     )
+
+
+def apply_network_shaping(
+    project_name: str,
+    n_nodes: int,
+    latencies: list[int] | None,
+    bandwidth_mbit: int | None,
+):
+    """Apply tc netem rules to running containers via docker exec.
+
+    Called AFTER docker compose up so the containers have network access
+    for installing iproute2. Errors are reported instead of silently ignored.
+    """
+    if not latencies and not bandwidth_mbit:
+        return
+
+    print(f"\n  Applying network shaping (tc netem)...")
+    success = 0
+
+    for i in range(n_nodes):
+        container = f"{project_name}-p2pnode-{i + 1}-1"
+        lat = latencies[i % len(latencies)] if latencies else None
+
+        needs_tc = (lat is not None and lat > 0) or (
+            bandwidth_mbit is not None and bandwidth_mbit > 0
+        )
+        if not needs_tc:
+            continue
+
+        tc_cmds = "apk add --no-cache iproute2 > /dev/null 2>&1"
+        if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
+            tc_cmds += f" && tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
+            tc_cmds += f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+        elif lat and lat > 0:
+            tc_cmds += f" && tc qdisc add dev eth0 root netem delay {lat}ms"
+        elif bandwidth_mbit and bandwidth_mbit > 0:
+            tc_cmds += f" && tc qdisc add dev eth0 root tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+
+        result = subprocess.run(
+            ["docker", "exec", container, "sh", "-c", tc_cmds],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            label = f"delay={lat}ms" if lat else ""
+            if bandwidth_mbit:
+                label += f" bw={bandwidth_mbit}mbit"
+            print(f"    p2pnode-{i + 1}: {label.strip()}")
+            success += 1
+        else:
+            err = (result.stderr + result.stdout).strip()
+            print(f"    {YELLOW}p2pnode-{i + 1}: FAILED — {err}{NC}")
+
+    if success == 0:
+        print(f"  {YELLOW}WARNING: tc netem failed on all nodes. "
+              f"Latency simulation will not take effect.{NC}")
+        print(f"  {YELLOW}Check that the host kernel has sch_netem loaded: "
+              f"modprobe sch_netem{NC}")
+    else:
+        print(f"  Network shaping applied to {success}/{n_nodes} nodes\n")
 
 
 def docker_compose_down(compose_file: str, project_name: str):
@@ -228,6 +287,8 @@ def run_p2p_phase(
     client_dir: str,
     ips_file: str,
     outdir: str,
+    latencies: list[int] | None = None,
+    bandwidth_mbit: int | None = None,
 ) -> LatencyResult:
     label = "mump2p (RLNC)" if protocol == "optimum" else "GossipSub"
     print(f"\n{'#'*60}")
@@ -255,6 +316,7 @@ def run_p2p_phase(
 
     try:
         docker_compose_up(compose_file, project)
+        apply_network_shaping(project, n_nodes, latencies, bandwidth_mbit)
 
         run_test_sh = os.path.join(SCRIPT_DIR, "run_test.sh")
         subprocess.run(
@@ -295,10 +357,10 @@ def mode_compare(args):
         if not tc_ok:
             print(f"\n{YELLOW}{'!'*60}")
             print(f"  WARNING: tc netem is NOT supported on this host.")
-            print(f"  macOS Docker Desktop (Rosetta/amd64) does not support")
-            print(f"  the rtnetlink interface required by tc qdisc.")
+            print(f"  Possible causes: missing sch_netem kernel module,")
+            print(f"  or macOS Docker Desktop Rosetta emulation.")
+            print(f"  Try: modprobe sch_netem (Linux) or run on native Linux.")
             print(f"  --latency {args.latency} will be IGNORED — running without delay.")
-            print(f"  For real latency simulation, run on a Linux host.")
             print(f"{'!'*60}{NC}\n")
             latencies = None
 
@@ -331,6 +393,7 @@ def mode_compare(args):
     r_gs = run_p2p_phase(
         "gossipsub", n_nodes, msg_size, count,
         gs_compose, client_dir, ips_file, outdir,
+        latencies=latencies, bandwidth_mbit=bandwidth,
     )
     results.append(r_gs)
 
@@ -344,6 +407,7 @@ def mode_compare(args):
     r_opt = run_p2p_phase(
         "optimum", n_nodes, msg_size, count,
         opt_compose, client_dir, ips_file, outdir,
+        latencies=latencies, bandwidth_mbit=bandwidth,
     )
     results.append(r_opt)
 
@@ -413,8 +477,8 @@ def mode_sweep(args):
     if latencies and not check_tc_support():
         print(f"\n{YELLOW}{'!'*60}")
         print(f"  WARNING: tc netem is NOT supported on this host.")
+        print(f"  Try: modprobe sch_netem (Linux) or run on native Linux.")
         print(f"  --latency {latency_preset} will be IGNORED.")
-        print(f"  For real latency simulation, run on a Linux host.")
         print(f"{'!'*60}{NC}\n")
         latencies = None
 
@@ -444,6 +508,7 @@ def mode_sweep(args):
         result = run_p2p_phase(
             "optimum", n_nodes, msg_size, count,
             opt_compose, client_dir, ips_file, outdir,
+            latencies=latencies, bandwidth_mbit=bandwidth,
         )
 
         labeled = LatencyResult(

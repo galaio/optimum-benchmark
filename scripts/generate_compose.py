@@ -103,16 +103,6 @@ def build_p2pnode(
     )
     if needs_tc:
         svc["cap_add"] = ["NET_ADMIN"]
-        tc_cmds = "apk add --no-cache iproute2 > /dev/null 2>&1 || true"
-        if latency_ms and latency_ms > 0 and bandwidth_mbit and bandwidth_mbit > 0:
-            tc_cmds += f"; tc qdisc add dev eth0 root handle 1: netem delay {latency_ms}ms || true"
-            tc_cmds += f"; tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms || true"
-        elif latency_ms and latency_ms > 0:
-            tc_cmds += f"; tc qdisc add dev eth0 root netem delay {latency_ms}ms || true"
-        elif bandwidth_mbit and bandwidth_mbit > 0:
-            tc_cmds += f"; tc qdisc add dev eth0 root tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms || true"
-        tc_cmds += "; exec /p2pnode/p2pnode"
-        svc["entrypoint"] = ["/bin/sh", "-c", tc_cmds]
 
     return name, svc
 

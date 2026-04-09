@@ -1,3 +1,4 @@
 [submodule "optimum-dev-setup-guide"]
 	path = optimum-dev-setup-guide
-	url = https://github.com/getoptimum/optimum-dev-setup-guide.git
+	url = https://github.com/galaio/optimum-dev-setup-guide.git
+	branch = fix/grpc-backpressure

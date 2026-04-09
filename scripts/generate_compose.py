@@ -13,7 +13,7 @@ import os
 import yaml
 
 
-SUBNET = "172.28.0.0/16"
+DEFAULT_LAN_SECOND_OCTET = 28
 BASE_IP_OCTET = 12
 PROXY_IP_OCTET = 10
 SIDECAR_PORT = 33212
@@ -25,8 +25,8 @@ HOST_API_BASE = 9091
 MAX_MSG_SIZE = 1048576
 
 
-def node_ip(index: int) -> str:
-    return f"172.28.0.{BASE_IP_OCTET + index}"
+def node_ip(index: int, lan_second_octet: int) -> str:
+    return f"172.{lan_second_octet}.0.{BASE_IP_OCTET + index}"
 
 
 def build_p2pnode(
@@ -34,12 +34,13 @@ def build_p2pnode(
     n_nodes: int,
     mode: str,
     bootstrap_peer_id: str,
+    lan_second_octet: int,
     latency_ms: int | None = None,
     bandwidth_mbit: int | None = None,
     shard_factor: int = 4,
 ) -> tuple[str, dict]:
     name = f"p2pnode-{index + 1}"
-    ip = node_ip(index)
+    ip = node_ip(index, lan_second_octet)
 
     env = [
         "LOG_LEVEL=debug",
@@ -64,7 +65,7 @@ def build_p2pnode(
         ]
         if index > 0:
             env.append(
-                f"BOOTSTRAP_PEERS=/ip4/{node_ip(0)}/tcp/{GOSSIPSUB_PORT}/p2p/{bootstrap_peer_id}"
+                f"BOOTSTRAP_PEERS=/ip4/{node_ip(0, lan_second_octet)}/tcp/{GOSSIPSUB_PORT}/p2p/{bootstrap_peer_id}"
             )
     else:
         env += [
@@ -79,7 +80,7 @@ def build_p2pnode(
         ]
         if index > 0:
             env.append(
-                f"BOOTSTRAP_PEERS=/ip4/{node_ip(0)}/tcp/{OPTIMUM_PORT}/p2p/{bootstrap_peer_id}"
+                f"BOOTSTRAP_PEERS=/ip4/{node_ip(0, lan_second_octet)}/tcp/{OPTIMUM_PORT}/p2p/{bootstrap_peer_id}"
             )
 
     svc: dict = {
@@ -107,7 +108,7 @@ def build_p2pnode(
     return name, svc
 
 
-def build_proxy(n_nodes: int) -> tuple[str, dict]:
+def build_proxy(n_nodes: int, lan_second_octet: int) -> tuple[str, dict]:
     p2p_nodes = ",".join(f"p2pnode-{i + 1}:{SIDECAR_PORT}" for i in range(n_nodes))
     depends = [f"p2pnode-{i + 1}" for i in range(n_nodes)]
 
@@ -123,7 +124,7 @@ def build_proxy(n_nodes: int) -> tuple[str, dict]:
             "LOG_LEVEL=debug",
             f"P2P_NODES={p2p_nodes}",
         ],
-        "networks": {"bench-network": {"ipv4_address": f"172.28.0.{PROXY_IP_OCTET}"}},
+        "networks": {"bench-network": {"ipv4_address": f"172.{lan_second_octet}.0.{PROXY_IP_OCTET}"}},
         "depends_on": depends,
     }
     return "proxy-1", svc
@@ -137,16 +138,18 @@ def generate(
     latencies: list[int] | None = None,
     bandwidth_mbit: int | None = None,
     shard_factor: int = 4,
+    lan_second_octet: int = DEFAULT_LAN_SECOND_OCTET,
 ) -> str:
     services: dict = {}
 
-    proxy_name, proxy_svc = build_proxy(n_nodes)
+    subnet = f"172.{lan_second_octet}.0.0/16"
+    proxy_name, proxy_svc = build_proxy(n_nodes, lan_second_octet)
     services[proxy_name] = proxy_svc
 
     for i in range(n_nodes):
         lat = latencies[i % len(latencies)] if latencies else None
         name, svc = build_p2pnode(
-            i, n_nodes, mode, bootstrap_peer_id,
+            i, n_nodes, mode, bootstrap_peer_id, lan_second_octet,
             latency_ms=lat, bandwidth_mbit=bandwidth_mbit,
             shard_factor=shard_factor,
         )
@@ -157,7 +160,7 @@ def generate(
         "networks": {
             "bench-network": {
                 "driver": "bridge",
-                "ipam": {"config": [{"subnet": SUBNET}]},
+                "ipam": {"config": [{"subnet": subnet}]},
             }
         },
     }
@@ -192,6 +195,7 @@ def main():
             args.nodes, m, args.peer_id, args.outdir,
             latencies=latencies, bandwidth_mbit=args.bandwidth,
             shard_factor=args.shard_factor,
+            lan_second_octet=DEFAULT_LAN_SECOND_OCTET,
         )
         print(f"Generated: {path}")
 

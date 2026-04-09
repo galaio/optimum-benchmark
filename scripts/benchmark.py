@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import platform
@@ -29,7 +30,7 @@ SETUP_GUIDE = os.path.join(PROJECT_ROOT, "optimum-dev-setup-guide")
 DIRECT_BENCH = os.path.join(PROJECT_ROOT, "tools", "libp2p-direct")
 
 sys.path.insert(0, SCRIPT_DIR)
-from generate_compose import generate
+from generate_compose import BASE_IP_OCTET, DEFAULT_LAN_SECOND_OCTET, generate
 from parse_results import (
     LatencyResult,
     format_markdown_table,
@@ -180,6 +181,13 @@ def resolve_bandwidths(spec: str | None) -> list[int] | None:
     return parts
 
 
+def pick_docker_lan_second_octet(outdir: str) -> int:
+    """Pick 172.x.0.0/16 for this run so compose networks avoid Docker pool overlap."""
+    digest = hashlib.sha256(os.path.abspath(outdir).encode()).hexdigest()
+    h = int(digest[:8], 16)
+    return 16 + (h % 239)
+
+
 # ─── Docker helpers ──────────────────────────────────────────────────────────
 
 def docker_compose_up(compose_file: str, project_name: str):
@@ -192,7 +200,10 @@ def docker_compose_up(compose_file: str, project_name: str):
         check=False,
     )
     subprocess.run(
-        ["docker", "compose", "-f", compose_file, "-p", project_name, "up", "-d"],
+        [
+            "docker", "compose", "-f", compose_file, "-p", project_name,
+            "up", "-d", "--force-recreate",
+        ],
         check=True,
     )
 
@@ -208,6 +219,20 @@ def _ensure_sch_netem():
     else:
         print(f"  {YELLOW}modprobe sch_netem failed: {result.stderr.strip()}")
         print(f"  tc netem delay may not work without this kernel module.{NC}")
+
+
+def _tc_delete_root_nsenter(
+    container: str, nsenter_bin: str, tc_bin: str,
+) -> None:
+    """Remove existing root qdisc so a fresh netem rule can be added (avoids EEXIST)."""
+    pid = _get_container_pid(container)
+    if not pid:
+        return
+    subprocess.run(
+        [nsenter_bin, "-t", pid, "-n", tc_bin,
+         "qdisc", "del", "dev", "eth0", "root"],
+        capture_output=True, text=True,
+    )
 
 
 def _get_container_pid(container: str) -> str | None:
@@ -241,6 +266,7 @@ def _apply_tc_via_nsenter(
         return False
 
     base = [nsenter_bin, "-t", pid, "-n", tc_bin]
+    _tc_delete_root_nsenter(container, nsenter_bin, tc_bin)
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
         if not _run_tc_cmd(
             base + ["qdisc", "add", "dev", "eth0",
@@ -290,17 +316,20 @@ def _apply_tc_via_docker_exec(container: str, lat: int | None, bandwidth_mbit: i
             print(f"    {YELLOW}tc still missing after iproute2 install in {container}{NC}")
             return False
 
+    reset = "tc qdisc del dev eth0 root 2>/dev/null || true; "
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
         tc_cmds = (
-            f"tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
+            reset
+            + f"tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
             f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf"
             f" rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
         )
     elif lat and lat > 0:
-        tc_cmds = f"tc qdisc add dev eth0 root netem delay {lat}ms"
+        tc_cmds = reset + f"tc qdisc add dev eth0 root netem delay {lat}ms"
     elif bandwidth_mbit and bandwidth_mbit > 0:
         tc_cmds = (
-            f"tc qdisc add dev eth0 root tbf"
+            reset
+            + f"tc qdisc add dev eth0 root tbf"
             f" rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
         )
     else:
@@ -332,6 +361,7 @@ def apply_network_shaping(
     n_nodes: int,
     latencies: list[int] | None,
     bandwidth_mbit: int | None,
+    lan_second_octet: int = DEFAULT_LAN_SECOND_OCTET,
 ):
     """Apply tc netem rules to running containers.
 
@@ -428,7 +458,8 @@ def apply_network_shaping(
         print(f"  {YELLOW}WARNING: delay parameter missing in qdisc!{NC}")
 
     if n_nodes >= 2:
-        target_ip = f"172.28.0.{13}"  # p2pnode-2
+        # p2pnode-2 is index 1 → BASE_IP_OCTET + 1
+        target_ip = f"172.{lan_second_octet}.0.{BASE_IP_OCTET + 1}"
         ping_result = subprocess.run(
             ["docker", "exec", first_container, "sh", "-c",
              f"apk add --no-cache iputils > /dev/null 2>&1; "
@@ -560,6 +591,7 @@ def run_p2p_phase(
     outdir: str,
     latencies: list[int] | None = None,
     bandwidth_mbit: int | None = None,
+    lan_second_octet: int = DEFAULT_LAN_SECOND_OCTET,
 ) -> LatencyResult:
     label = "mump2p (RLNC)" if protocol == "optimum" else "GossipSub"
     print(f"\n{'#'*60}")
@@ -587,7 +619,10 @@ def run_p2p_phase(
 
     try:
         docker_compose_up(compose_file, project)
-        apply_network_shaping(project, n_nodes, latencies, bandwidth_mbit)
+        apply_network_shaping(
+            project, n_nodes, latencies, bandwidth_mbit,
+            lan_second_octet=lan_second_octet,
+        )
 
         run_test_sh = os.path.join(SCRIPT_DIR, "run_test.sh")
         subprocess.run(
@@ -647,6 +682,8 @@ def mode_compare(args):
     ensure_identity()
     client_dir = ensure_client_binaries()
     ips_file = write_ips_file(n_nodes, outdir)
+    lan_octet = pick_docker_lan_second_octet(outdir)
+    print(f"  Docker bench LAN: 172.{lan_octet}.0.0/16 (derived from output dir)")
 
     results: list[LatencyResult] = []
 
@@ -660,11 +697,13 @@ def mode_compare(args):
     gs_compose = generate(
         n_nodes, "gossipsub", peer_id, compose_dir,
         latencies=latencies, bandwidth_mbit=bandwidth,
+        lan_second_octet=lan_octet,
     )
     r_gs = run_p2p_phase(
         "gossipsub", n_nodes, msg_size, count,
         gs_compose, client_dir, ips_file, outdir,
         latencies=latencies, bandwidth_mbit=bandwidth,
+        lan_second_octet=lan_octet,
     )
     results.append(r_gs)
 
@@ -674,11 +713,13 @@ def mode_compare(args):
     opt_compose = generate(
         n_nodes, "optimum", peer_id, compose_dir,
         latencies=latencies, bandwidth_mbit=bandwidth,
+        lan_second_octet=lan_octet,
     )
     r_opt = run_p2p_phase(
         "optimum", n_nodes, msg_size, count,
         opt_compose, client_dir, ips_file, outdir,
         latencies=latencies, bandwidth_mbit=bandwidth,
+        lan_second_octet=lan_octet,
     )
     results.append(r_opt)
 
@@ -763,6 +804,8 @@ def mode_sweep(args):
     ensure_identity()
     client_dir = ensure_client_binaries()
     ips_file = write_ips_file(n_nodes, outdir)
+    lan_octet = pick_docker_lan_second_octet(outdir)
+    print(f"  Docker bench LAN: 172.{lan_octet}.0.0/16 (derived from output dir)")
 
     all_results = []
 
@@ -775,11 +818,13 @@ def mode_sweep(args):
             n_nodes, "optimum", peer_id, compose_dir,
             latencies=latencies, bandwidth_mbit=bandwidth,
             shard_factor=sf,
+            lan_second_octet=lan_octet,
         )
         result = run_p2p_phase(
             "optimum", n_nodes, msg_size, count,
             opt_compose, client_dir, ips_file, outdir,
             latencies=latencies, bandwidth_mbit=bandwidth,
+            lan_second_octet=lan_octet,
         )
 
         labeled = LatencyResult(

@@ -7,8 +7,10 @@
 #   1. Wait for all nodes healthy AND peers connected (/api/v1/node-state)
 #   2. Subscribe all nodes (background p2p-multi-subscribe)
 #   3. Wait for topic GRAFT propagation
-#   4. Publish all messages via p2p-multi-publish (single process, 500ms interval)
-#   5. Wait for subscriber to collect traces, then kill
+#   4. Loop COUNT times: publish one message, then wait for that round to settle
+#      (default: BENCH_PER_ROUND_WAIT_SECS, or 8+N_NODES*3) so the mesh/trace catch up
+#      before the next message — avoids back-to-back publishes overlapping on the wire.
+#   5. Short final drain, then stop subscriber
 #
 # Usage:
 #   run_test.sh <protocol> <n_nodes> <msg_size_bytes> <count> <topic> \
@@ -40,7 +42,7 @@ PUB_CLIENT="${CLIENT_DIR}/p2p-client"
 MULTI_SUB="${CLIENT_DIR}/p2p-multi-subscribe"
 MULTI_PUB="${CLIENT_DIR}/p2p-multi-publish"
 
-for bin in "$PUB_CLIENT" "$MULTI_SUB"; do
+for bin in "$PUB_CLIENT" "$MULTI_SUB" "$MULTI_PUB"; do
     if [ ! -x "$bin" ]; then
         err "Binary not found or not executable: $bin"
         exit 1
@@ -55,6 +57,17 @@ fi
 PUB_ADDR=$(head -1 "$IPS_FILE" | tr -d '[:space:]')
 log "Protocol=$PROTOCOL  Nodes=$N_NODES  MsgSize=$MSG_SIZE  Count=$COUNT  Topic=$TOPIC"
 log "Publisher → $PUB_ADDR"
+
+# Seconds to wait after each published message before sending the next (one "round" per message).
+# Override for faster local runs, e.g. BENCH_PER_ROUND_WAIT_SECS=5
+if [ -n "${BENCH_PER_ROUND_WAIT_SECS:-}" ]; then
+    PER_ROUND_WAIT="${BENCH_PER_ROUND_WAIT_SECS}"
+else
+    PER_ROUND_WAIT=$((8 + N_NODES * 3))
+fi
+# Brief wait after the last round so trace writers flush before SIGTERM.
+FINAL_DRAIN_SECS="${BENCH_FINAL_DRAIN_SECS:-10}"
+log "Per-round settle wait: ${PER_ROUND_WAIT}s (set BENCH_PER_ROUND_WAIT_SECS to override)"
 
 # ─── Step 1: Health check + peer connectivity ───────────────────────────────
 log "Waiting for nodes to be healthy..."
@@ -118,34 +131,38 @@ log "Subscriber PID=$SUB_PID"
 log "Waiting 15s for topic GRAFT propagation..."
 sleep 15
 
-# ─── Step 3: Publish messages ─────────────────────────────────────────────────
-log "Publishing $COUNT messages of ${MSG_SIZE} bytes..."
+# ─── Step 3: Publish messages (one round per message) ─────────────────────────
+log "Publishing $COUNT messages of ${MSG_SIZE} bytes (sequential rounds, ${PER_ROUND_WAIT}s settle after each)..."
 
-DATASIZE=$((MSG_SIZE / 2))
-if [ "$DATASIZE" -lt 1 ]; then
-    DATASIZE=1
+if [ "$MSG_SIZE" -lt 1 ]; then
+    err "MSG_SIZE must be >= 1"
+    exit 1
 fi
 
 PUB_IPS_FILE=$(mktemp /tmp/bench_pub_ips.XXXXXX)
 head -1 "$IPS_FILE" > "$PUB_IPS_FILE"
 
-"$MULTI_PUB" \
-    -topic="$TOPIC" \
-    -ipfile="$PUB_IPS_FILE" \
-    -start-index=0 \
-    -end-index=1 \
-    -count="$COUNT" \
-    -datasize="$DATASIZE" \
-    -sleep=500ms \
-    2>&1 || warn "Publish may have partially failed"
+for i in $(seq 1 "$COUNT"); do
+    log "  Round $i/$COUNT: publish (≈ ${MSG_SIZE} B), then wait ${PER_ROUND_WAIT}s ..."
+    "$MULTI_PUB" \
+        -topic="$TOPIC" \
+        -ipfile="$PUB_IPS_FILE" \
+        -start-index=0 \
+        -end-index=1 \
+        -count=1 \
+        -datasize="$MSG_SIZE" \
+        -sleep=0 \
+        2>&1 || warn "Publish $i may have failed"
+    log "  Round $i/$COUNT: settling (${PER_ROUND_WAIT}s) ..."
+    sleep "$PER_ROUND_WAIT"
+done
 
 rm -f "$PUB_IPS_FILE"
-ok "All $COUNT messages published"
+ok "All $COUNT messages published (${COUNT} settle periods of ${PER_ROUND_WAIT}s each)"
 
-# ─── Step 4: Wait for propagation ───────────────────────────────────────────
-DRAIN_SECS=30
-log "Waiting ${DRAIN_SECS}s for message propagation..."
-sleep "$DRAIN_SECS"
+# ─── Step 4: Final drain ────────────────────────────────────────────────────
+log "Final drain ${FINAL_DRAIN_SECS}s before stopping subscribers..."
+sleep "$FINAL_DRAIN_SECS"
 
 # ─── Step 5: Kill subscriber, clean up ──────────────────────────────────────
 log "Stopping subscriber (PID=$SUB_PID)..."

@@ -7,7 +7,7 @@
 #   1. Wait for all nodes healthy AND peers connected (/api/v1/node-state)
 #   2. Subscribe all nodes (background p2p-multi-subscribe)
 #   3. Wait for topic GRAFT propagation
-#   4. Publish messages one-by-one via p2p-client (3s gap to avoid gRPC backpressure)
+#   4. Publish all messages via p2p-multi-publish (single process, 500ms interval)
 #   5. Wait for subscriber to collect traces, then kill
 #
 # Usage:
@@ -118,39 +118,32 @@ log "Subscriber PID=$SUB_PID"
 log "Waiting 15s for topic GRAFT propagation..."
 sleep 15
 
-# ─── Step 3: Publish messages one by one ─────────────────────────────────────
-log "Publishing $COUNT messages of ${MSG_SIZE} bytes (3s interval)..."
+# ─── Step 3: Publish messages ─────────────────────────────────────────────────
+log "Publishing $COUNT messages of ${MSG_SIZE} bytes..."
 
 DATASIZE=$((MSG_SIZE / 2))
 if [ "$DATASIZE" -lt 1 ]; then
     DATASIZE=1
 fi
 
-# One message per process invocation to avoid gRPC backpressure.
-# Each call opens a fresh gRPC connection, sends 1 message, then exits.
 PUB_IPS_FILE=$(mktemp /tmp/bench_pub_ips.XXXXXX)
 head -1 "$IPS_FILE" > "$PUB_IPS_FILE"
 
-for i in $(seq 1 "$COUNT"); do
-    log "  Publishing message $i/$COUNT (datasize=$DATASIZE) ..."
-    "$MULTI_PUB" \
-        -topic="$TOPIC" \
-        -ipfile="$PUB_IPS_FILE" \
-        -start-index=0 \
-        -end-index=1 \
-        -count=1 \
-        -datasize="$DATASIZE" \
-        2>&1 || warn "Publish $i may have failed"
-    if [ "$i" -lt "$COUNT" ]; then
-        sleep 3
-    fi
-done
+"$MULTI_PUB" \
+    -topic="$TOPIC" \
+    -ipfile="$PUB_IPS_FILE" \
+    -start-index=0 \
+    -end-index=1 \
+    -count="$COUNT" \
+    -datasize="$DATASIZE" \
+    -sleep=500ms \
+    2>&1 || warn "Publish may have partially failed"
 
 rm -f "$PUB_IPS_FILE"
 ok "All $COUNT messages published"
 
 # ─── Step 4: Wait for propagation ───────────────────────────────────────────
-DRAIN_SECS=$((10 + COUNT * 2))
+DRAIN_SECS=30
 log "Waiting ${DRAIN_SECS}s for message propagation..."
 sleep "$DRAIN_SECS"
 

@@ -67,7 +67,7 @@ bash run_direct_bench.sh 8 102400 10 500 /tmp/direct.tsv
 1. `generate_compose.py` dynamically generates an N-node docker-compose and starts the cluster
 2. `/api/v1/health` verifies all nodes are healthy
 3. `p2p-multi-subscribe` listens on all receiving nodes, collecting trace TSV
-4. Messages are sent one at a time (bash script, 3s interval to avoid gRPC backpressure)
+4. `p2p-multi-publish` sends all messages in a single process (500ms interval)
 5. `parse_results.py` parses trace TSV, filtering by topic to prevent cross-phase leakage
 
 **Timing Model** (node-internal clocks, no process-spawn overhead):
@@ -162,8 +162,8 @@ p2pnode v0.0.1-rc16 has a hard limit of **1,048,576 bytes**. The `OPTIMUM_MAX_MS
 ### 2. Python subprocess deadlock with Go binaries
 `p2p-multi-publish` / `p2p-multi-subscribe` randomly hang when invoked via `subprocess.run()`, but work fine when executed directly from shell. All actual pub/sub calls are made through `run_test.sh` (bash); Python only handles environment setup and result parsing.
 
-### 3. gRPC backpressure stalls consecutive sends
-`p2p-multi-publish -count=N` blocks after 7-8 consecutive large messages. Mitigated by sending one message per process invocation with 3s intervals between calls, ensuring a fresh gRPC connection for each message.
+### 3. gRPC backpressure (fixed)
+`p2p-multi-publish` originally blocked after 7-8 consecutive large messages because it used a bidi gRPC stream (`ListenCommands`) with `Send()`-only — never calling `Recv()`. Server responses filled the HTTP/2 receive window, causing flow-control backpressure. Fixed by: (a) adding a background goroutine to drain `Recv()`, (b) setting 1GB `InitialWindowSize` / `InitialConnWindowSize` on the gRPC client (matching the proxy client's configuration).
 
 ### 4. Topic cross-phase leakage
 P2P nodes broadcast all topic messages to gRPC subscribers. Filtering by the `topic` field in trace TSV prevents contamination between benchmark phases.

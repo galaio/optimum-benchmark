@@ -52,6 +52,9 @@ DEFAULT_MSG_SIZE = "100kb"
 DEFAULT_COUNT = 10
 DEFAULT_BANDWIDTH = 10000
 
+# p2pnode rc16 + tc netem: payloads above this often never show up in GossipSub/mump2p traces.
+P2P_WAN_SAFE_MSG_BYTES = 32 * 1024
+
 P2PNODE_IMAGE = "getoptimum/p2pnode:v0.0.1-rc16"
 
 YELLOW = "\033[1;33m"
@@ -152,6 +155,17 @@ def check_tc_support() -> bool:
         return True
     except Exception:
         return False
+
+
+def apply_wan_p2p_msg_cap(msg_size: int, latencies: list[int] | None) -> int:
+    """Shrink payload when emulating WAN so Docker GossipSub/mump2p phases can deliver."""
+    if not latencies or msg_size <= P2P_WAN_SAFE_MSG_BYTES:
+        return msg_size
+    print(
+        f"{YELLOW}  Auto-capping MsgSize {msg_size}B → {P2P_WAN_SAFE_MSG_BYTES}B for WAN emulation "
+        f"(p2pnode rc16: larger payloads + netem typically yield empty GossipSub/mump2p traces).{NC}\n"
+    )
+    return P2P_WAN_SAFE_MSG_BYTES
 
 
 def parse_msg_size(s: str) -> int:
@@ -779,12 +793,7 @@ def mode_compare(args):
             print(f"{'!'*60}{NC}\n")
             latencies = None
 
-    if latencies and msg_size > 32 * 1024:
-        print(
-            f"{YELLOW}  WARNING: With emulated WAN latency, p2pnode rc16 often fails to deliver "
-            f"GossipSub/mump2p payloads above ~32KB (empty traces). MsgSize={msg_size}B. "
-            f"If results show no data, retry with e.g. --msg-size 16kb or 32kb.{NC}\n"
-        )
+    msg_size = apply_wan_p2p_msg_cap(msg_size, latencies)
 
     print(f"\n{'='*60}")
     print(f"  Optimum Benchmark — 3-Way Compare")
@@ -913,11 +922,7 @@ def mode_sweep(args):
         print(f"{'!'*60}{NC}\n")
         latencies = None
 
-    if latencies and msg_size > 32 * 1024:
-        print(
-            f"{YELLOW}  WARNING: WAN + MsgSize={msg_size}B often yields empty traces with rc16; "
-            f"consider --msg-size 16kb or 32kb.{NC}\n"
-        )
+    msg_size = apply_wan_p2p_msg_cap(msg_size, latencies)
 
     print(f"\n{'='*60}")
     print(f"  Optimum Benchmark — Shard Factor Sweep")

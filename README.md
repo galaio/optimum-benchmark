@@ -178,7 +178,7 @@ GossipSub traces only contain `DELIVER_MESSAGE`. Latency baseline is the spread 
 The first message in each phase suffers from incomplete topic subscription GRAFT propagation, resulting in abnormally high latency (~1-3s). It is automatically excluded from statistics.
 
 ### 8. Large message + WAN latency combination failure
-900KB messages work fine without latency, but adding `--latency wan` causes GossipSub/mump2p to receive nothing. Likely due to internal gossip protocol message propagation timeouts being exceeded by the large message + high latency combination. **Use `--msg-size 100kb` for WAN tests**.
+With emulated WAN (`--latency` not `off`), p2pnode rc16 often delivers **nothing** for GossipSub/mump2p if the payload is too large (often above ~32KB). **`benchmark.py` auto-caps MsgSize to 32KB when tc latency is active** so compare/sweep get non-empty traces. For full-size payloads without that limit, run with `--latency off` (or pass an explicit `--msg-size` at or below 32kb under WAN).
 
 ### 9. Network latency simulation requires a native Linux host
 `--latency` relies on the Linux kernel's `tc netem` (traffic control) to inject network delay into container network namespaces via `nsenter`. This does **not** work on:

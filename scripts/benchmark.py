@@ -577,12 +577,35 @@ def docker_compose_down(compose_file: str, project_name: str):
 
 # ─── Client binary helpers ───────────────────────────────────────────────────
 
+def _apply_vendor_grpc_client_patch() -> None:
+    """Overlay patched shared/utils.go so clones work without unpublished submodule commits."""
+    patch_src = os.path.join(
+        PROJECT_ROOT, "vendor-patches", "optimum-dev-setup-guide",
+        "grpc_p2p_client", "shared", "utils.go",
+    )
+    patch_dst = os.path.join(SETUP_GUIDE, "grpc_p2p_client", "shared", "utils.go")
+    if not os.path.isfile(patch_src) or not os.path.isdir(os.path.dirname(patch_dst)):
+        return
+    shutil.copy2(patch_src, patch_dst)
+
+
 def ensure_client_binaries() -> str:
     client_dir = os.path.join(SETUP_GUIDE, "grpc_p2p_client")
     p2p_client = os.path.join(client_dir, "p2p-client")
     multi_sub = os.path.join(client_dir, "p2p-multi-subscribe")
 
-    if os.path.isfile(p2p_client) and os.path.isfile(multi_sub):
+    _apply_vendor_grpc_client_patch()
+
+    patch_src = os.path.join(
+        PROJECT_ROOT, "vendor-patches", "optimum-dev-setup-guide",
+        "grpc_p2p_client", "shared", "utils.go",
+    )
+    stale = False
+    if os.path.isfile(patch_src) and os.path.isfile(multi_sub):
+        if os.path.getmtime(patch_src) > os.path.getmtime(multi_sub):
+            stale = True
+
+    if os.path.isfile(p2p_client) and os.path.isfile(multi_sub) and not stale:
         return client_dir
 
     print("Building gRPC client binaries...")

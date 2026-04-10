@@ -67,7 +67,11 @@ else
 fi
 # Brief wait after the last round so trace writers flush before SIGTERM.
 FINAL_DRAIN_SECS="${BENCH_FINAL_DRAIN_SECS:-10}"
+# Longer defaults applied under WAN via benchmark.py (override any time).
+MESH_STABILIZE_SECS="${BENCH_MESH_STABILIZE_SECS:-15}"
+TOPIC_GRAFT_WAIT_SECS="${BENCH_TOPIC_GRAFT_WAIT_SECS:-15}"
 log "Per-round settle wait: ${PER_ROUND_WAIT}s (set BENCH_PER_ROUND_WAIT_SECS to override)"
+log "Mesh stabilize: ${MESH_STABILIZE_SECS}s  Topic/GRAFT wait: ${TOPIC_GRAFT_WAIT_SECS}s (BENCH_MESH_STABILIZE_SECS / BENCH_TOPIC_GRAFT_WAIT_SECS)"
 
 # ─── Step 1: Health check + peer connectivity ───────────────────────────────
 log "Waiting for nodes to be healthy..."
@@ -112,8 +116,8 @@ except:
 done
 
 # Extra settle time for mesh formation
-log "Waiting 15s for mesh stabilization..."
-sleep 15
+log "Waiting ${MESH_STABILIZE_SECS}s for mesh stabilization..."
+sleep "${MESH_STABILIZE_SECS}"
 
 # ─── Step 2: Subscribe all nodes ────────────────────────────────────────────
 log "Starting multi-subscribe on all $N_NODES nodes, topic=$TOPIC ..."
@@ -128,8 +132,8 @@ SUB_PID=$!
 log "Subscriber PID=$SUB_PID"
 
 # Wait for gRPC streams to establish + topic GRAFT propagation
-log "Waiting 15s for topic GRAFT propagation..."
-sleep 15
+log "Waiting ${TOPIC_GRAFT_WAIT_SECS}s for topic GRAFT propagation..."
+sleep "${TOPIC_GRAFT_WAIT_SECS}"
 
 # ─── Step 3: Publish messages (one round per message) ─────────────────────────
 log "Publishing $COUNT messages of ${MSG_SIZE} bytes (sequential rounds, ${PER_ROUND_WAIT}s settle after each)..."

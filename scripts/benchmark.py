@@ -54,6 +54,8 @@ DEFAULT_BANDWIDTH = 10000
 
 # p2pnode rc16 + tc netem: payloads above this often never show up in GossipSub/mump2p traces.
 P2P_WAN_SAFE_MSG_BYTES = 32 * 1024
+# Default netem limit=1000 packets often tail-drops bursty pubsub under delay; raise for benchmarks.
+NETEM_PACKET_LIMIT = "50000"
 
 P2PNODE_IMAGE = "getoptimum/p2pnode:v0.0.1-rc16"
 
@@ -155,6 +157,24 @@ def check_tc_support() -> bool:
         return True
     except Exception:
         return False
+
+
+def _netem_delay_tokens(lat_ms: int) -> list[str]:
+    return ["netem", "delay", f"{lat_ms}ms", "limit", NETEM_PACKET_LIMIT]
+
+
+def p2p_subprocess_env(n_nodes: int, latencies: list[int] | None) -> dict[str, str]:
+    """Extra env for run_test.sh when tc latency is on (longer mesh/settle; user can override)."""
+    env = os.environ.copy()
+    if not latencies:
+        return env
+    # Default per-round wait is 8+N*3; under WAN use at least 12+N*5 so large frames clear the mesh.
+    lan_wait = 8 + n_nodes * 3
+    wan_wait = 12 + n_nodes * 5
+    env.setdefault("BENCH_PER_ROUND_WAIT_SECS", str(max(lan_wait, wan_wait)))
+    env.setdefault("BENCH_MESH_STABILIZE_SECS", "28")
+    env.setdefault("BENCH_TOPIC_GRAFT_WAIT_SECS", "28")
+    return env
 
 
 def apply_wan_p2p_msg_cap(msg_size: int, latencies: list[int] | None) -> int:
@@ -340,16 +360,15 @@ def _apply_tc_via_nsenter(
         return False
 
     base = [nsenter_bin, "-t", pid, "-n", tc_bin]
+    delay_tc = _netem_delay_tokens(lat) if lat and lat > 0 else []
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
         _tc_delete_root_nsenter(container, nsenter_bin, tc_bin)
         if not _run_tc_cmd(
-            base + ["qdisc", "add", "dev", "eth0",
-                    "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
+            base + ["qdisc", "add", "dev", "eth0", "root", "handle", "1:"] + delay_tc,
             container,
         ):
             if not _run_tc_cmd(
-                base + ["qdisc", "replace", "dev", "eth0",
-                        "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
+                base + ["qdisc", "replace", "dev", "eth0", "root", "handle", "1:"] + delay_tc,
                 container,
             ):
                 return False
@@ -362,13 +381,13 @@ def _apply_tc_via_nsenter(
     elif lat and lat > 0:
         # replace swaps the root qdisc atomically (avoids RTNETLINK File exists after failed del).
         if _run_tc_cmd(
-            base + ["qdisc", "replace", "dev", "eth0", "root", "netem", "delay", f"{lat}ms"],
+            base + ["qdisc", "replace", "dev", "eth0", "root"] + delay_tc,
             container,
         ):
             return True
         _tc_delete_root_nsenter(container, nsenter_bin, tc_bin)
         return _run_tc_cmd(
-            base + ["qdisc", "add", "dev", "eth0", "root", "netem", "delay", f"{lat}ms"],
+            base + ["qdisc", "add", "dev", "eth0", "root"] + delay_tc,
             container,
         )
     elif bandwidth_mbit and bandwidth_mbit > 0:
@@ -413,17 +432,19 @@ def _apply_tc_via_docker_exec(container: str, lat: int | None, bandwidth_mbit: i
 
     reset = "tc qdisc del dev eth0 root 2>/dev/null || true; "
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
+        netem_d = f"netem delay {lat}ms limit {NETEM_PACKET_LIMIT}"
         tc_cmds = (
             reset
-            + f"tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
-            f" || tc qdisc replace dev eth0 root handle 1: netem delay {lat}ms"
+            + f"tc qdisc add dev eth0 root handle 1: {netem_d}"
+            f" || tc qdisc replace dev eth0 root handle 1: {netem_d}"
             f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf"
             f" rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
         )
     elif lat and lat > 0:
+        netem_d = f"netem delay {lat}ms limit {NETEM_PACKET_LIMIT}"
         tc_cmds = (
-            f"tc qdisc replace dev eth0 root netem delay {lat}ms || "
-            f"({reset}tc qdisc add dev eth0 root netem delay {lat}ms)"
+            f"tc qdisc replace dev eth0 root {netem_d} || "
+            f"({reset}tc qdisc add dev eth0 root {netem_d})"
         )
     elif bandwidth_mbit and bandwidth_mbit > 0:
         tc_cmds = (
@@ -746,8 +767,10 @@ def run_p2p_phase(
         )
 
         run_test_sh = os.path.join(SCRIPT_DIR, "run_test.sh")
-        # Per-round settle (default ~32s × count) + health/mesh waits — allow headroom.
+        # Per-round settle + health/mesh waits — allow headroom (WAN uses longer defaults).
         run_timeout = max(900, 300 + count * 50)
+        if latencies:
+            run_timeout = max(1400, 420 + count * 95)
         subprocess.run(
             [
                 "bash", run_test_sh,
@@ -756,6 +779,7 @@ def run_p2p_phase(
             ],
             check=True,
             timeout=run_timeout,
+            env=p2p_subprocess_env(n_nodes, latencies),
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"  [ERROR] Phase {protocol} failed: {e}")

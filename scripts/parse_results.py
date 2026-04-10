@@ -90,8 +90,9 @@ def parse_p2p_trace(filepath: str, protocol: str, topic_filter: str | None = Non
 
     latencies_ms = [ns_to_ms(x) for x in latencies_ns]
 
-    # Drop the first message (GRAFT delay anomaly)
-    if len(latencies_ms) > 2:
+    # Drop the first message (GRAFT / mesh warm-up) only when we have many spreads;
+    # under flaky WAN, discarding one of ~5 samples made the table look much worse than subscribers saw.
+    if len(latencies_ms) >= 8:
         latencies_ms = latencies_ms[1:]
 
     return LatencyResult(

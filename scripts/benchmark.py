@@ -756,6 +756,13 @@ def mode_compare(args):
             print(f"{'!'*60}{NC}\n")
             latencies = None
 
+    if latencies and msg_size > 32 * 1024:
+        print(
+            f"{YELLOW}  WARNING: With emulated WAN latency, p2pnode rc16 often fails to deliver "
+            f"GossipSub/mump2p payloads above ~32KB (empty traces). MsgSize={msg_size}B. "
+            f"If results show no data, retry with e.g. --msg-size 16kb or 32kb.{NC}\n"
+        )
+
     print(f"\n{'='*60}")
     print(f"  Optimum Benchmark — 3-Way Compare")
     print(f"  Nodes: {n_nodes}  MsgSize: {msg_size}B  Count: {count}")
@@ -882,6 +889,12 @@ def mode_sweep(args):
         print(f"  --latency {latency_preset} will be IGNORED.")
         print(f"{'!'*60}{NC}\n")
         latencies = None
+
+    if latencies and msg_size > 32 * 1024:
+        print(
+            f"{YELLOW}  WARNING: WAN + MsgSize={msg_size}B often yields empty traces with rc16; "
+            f"consider --msg-size 16kb or 32kb.{NC}\n"
+        )
 
     print(f"\n{'='*60}")
     print(f"  Optimum Benchmark — Shard Factor Sweep")

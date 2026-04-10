@@ -18,6 +18,7 @@ import datetime
 import hashlib
 import json
 import os
+import secrets
 import platform
 import shutil
 import subprocess
@@ -182,10 +183,15 @@ def resolve_bandwidths(spec: str | None) -> list[int] | None:
 
 
 def pick_docker_lan_second_octet(outdir: str) -> int:
-    """Pick 172.x.0.0/16 for this run so compose networks avoid Docker pool overlap."""
+    """Deterministic 172.x.0.0/16 from path (for reproducible local runs)."""
     digest = hashlib.sha256(os.path.abspath(outdir).encode()).hexdigest()
     h = int(digest[:8], 16)
     return 16 + (h % 239)
+
+
+def pick_random_docker_lan_octet() -> int:
+    """Random 172.x.0.0/16 per phase to avoid Docker 'pool overlaps' vs stale/other networks."""
+    return 16 + secrets.randbelow(239)
 
 
 # ─── Docker helpers ──────────────────────────────────────────────────────────
@@ -195,6 +201,15 @@ def docker_compose_up(compose_file: str, project_name: str):
     print(f"  Starting cluster: {project_name}")
     print(f"  Compose: {compose_file}")
     print(f"{'='*60}\n")
+    # Tear down same project first so stale networks/containers cannot block `up`.
+    subprocess.run(
+        [
+            "docker", "compose", "-f", compose_file, "-p", project_name,
+            "down", "-v", "--remove-orphans",
+        ],
+        check=False,
+        capture_output=True,
+    )
     subprocess.run(
         ["docker", "compose", "-f", compose_file, "-p", project_name, "pull"],
         check=False,
@@ -266,14 +281,19 @@ def _apply_tc_via_nsenter(
         return False
 
     base = [nsenter_bin, "-t", pid, "-n", tc_bin]
-    _tc_delete_root_nsenter(container, nsenter_bin, tc_bin)
     if lat and lat > 0 and bandwidth_mbit and bandwidth_mbit > 0:
+        _tc_delete_root_nsenter(container, nsenter_bin, tc_bin)
         if not _run_tc_cmd(
             base + ["qdisc", "add", "dev", "eth0",
                     "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
             container,
         ):
-            return False
+            if not _run_tc_cmd(
+                base + ["qdisc", "replace", "dev", "eth0",
+                        "root", "handle", "1:", "netem", "delay", f"{lat}ms"],
+                container,
+            ):
+                return False
         return _run_tc_cmd(
             base + ["qdisc", "add", "dev", "eth0",
                     "parent", "1:1", "handle", "10:", "tbf",
@@ -281,14 +301,30 @@ def _apply_tc_via_nsenter(
             container,
         )
     elif lat and lat > 0:
-        cmd = base + ["qdisc", "add", "dev", "eth0", "root", "netem", "delay", f"{lat}ms"]
+        # replace swaps the root qdisc atomically (avoids RTNETLINK File exists after failed del).
+        if _run_tc_cmd(
+            base + ["qdisc", "replace", "dev", "eth0", "root", "netem", "delay", f"{lat}ms"],
+            container,
+        ):
+            return True
+        _tc_delete_root_nsenter(container, nsenter_bin, tc_bin)
+        return _run_tc_cmd(
+            base + ["qdisc", "add", "dev", "eth0", "root", "netem", "delay", f"{lat}ms"],
+            container,
+        )
     elif bandwidth_mbit and bandwidth_mbit > 0:
+        if _run_tc_cmd(
+            base + ["qdisc", "replace", "dev", "eth0", "root", "tbf",
+                    "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"],
+            container,
+        ):
+            return True
+        _tc_delete_root_nsenter(container, nsenter_bin, tc_bin)
         cmd = base + ["qdisc", "add", "dev", "eth0", "root", "tbf",
                       "rate", f"{bandwidth_mbit}mbit", "burst", "256kb", "latency", "100ms"]
+        return _run_tc_cmd(cmd, container)
     else:
         return True
-
-    return _run_tc_cmd(cmd, container)
 
 
 def _container_has_tc(container: str) -> bool:
@@ -321,16 +357,19 @@ def _apply_tc_via_docker_exec(container: str, lat: int | None, bandwidth_mbit: i
         tc_cmds = (
             reset
             + f"tc qdisc add dev eth0 root handle 1: netem delay {lat}ms"
+            f" || tc qdisc replace dev eth0 root handle 1: netem delay {lat}ms"
             f" && tc qdisc add dev eth0 parent 1:1 handle 10: tbf"
             f" rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
         )
     elif lat and lat > 0:
-        tc_cmds = reset + f"tc qdisc add dev eth0 root netem delay {lat}ms"
+        tc_cmds = (
+            f"tc qdisc replace dev eth0 root netem delay {lat}ms || "
+            f"({reset}tc qdisc add dev eth0 root netem delay {lat}ms)"
+        )
     elif bandwidth_mbit and bandwidth_mbit > 0:
         tc_cmds = (
-            reset
-            + f"tc qdisc add dev eth0 root tbf"
-            f" rate {bandwidth_mbit}mbit burst 256kb latency 100ms"
+            f"tc qdisc replace dev eth0 root tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms || "
+            f"({reset}tc qdisc add dev eth0 root tbf rate {bandwidth_mbit}mbit burst 256kb latency 100ms)"
         )
     else:
         return True
@@ -625,6 +664,8 @@ def run_p2p_phase(
         )
 
         run_test_sh = os.path.join(SCRIPT_DIR, "run_test.sh")
+        # Per-round settle (default ~32s × count) + health/mesh waits — allow headroom.
+        run_timeout = max(900, 300 + count * 50)
         subprocess.run(
             [
                 "bash", run_test_sh,
@@ -632,7 +673,7 @@ def run_p2p_phase(
                 topic, client_dir, trace_out, ips_file,
             ],
             check=True,
-            timeout=600,
+            timeout=run_timeout,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"  [ERROR] Phase {protocol} failed: {e}")
@@ -682,8 +723,6 @@ def mode_compare(args):
     ensure_identity()
     client_dir = ensure_client_binaries()
     ips_file = write_ips_file(n_nodes, outdir)
-    lan_octet = pick_docker_lan_second_octet(outdir)
-    print(f"  Docker bench LAN: 172.{lan_octet}.0.0/16 (derived from output dir)")
 
     results: list[LatencyResult] = []
 
@@ -691,35 +730,39 @@ def mode_compare(args):
     r_direct = run_direct_phase(n_nodes, msg_size, count, outdir)
     results.append(r_direct)
 
-    # Phase 2: GossipSub
+    # Phase 2: GossipSub (random /16 per phase avoids Docker address-pool clashes)
     compose_dir = os.path.join(outdir, "gossipsub")
     os.makedirs(compose_dir, exist_ok=True)
+    lan_gs = pick_random_docker_lan_octet()
+    print(f"  Docker bench LAN (gossipsub): 172.{lan_gs}.0.0/16")
     gs_compose = generate(
         n_nodes, "gossipsub", peer_id, compose_dir,
         latencies=latencies, bandwidth_mbit=bandwidth,
-        lan_second_octet=lan_octet,
+        lan_second_octet=lan_gs,
     )
     r_gs = run_p2p_phase(
         "gossipsub", n_nodes, msg_size, count,
         gs_compose, client_dir, ips_file, outdir,
         latencies=latencies, bandwidth_mbit=bandwidth,
-        lan_second_octet=lan_octet,
+        lan_second_octet=lan_gs,
     )
     results.append(r_gs)
 
     # Phase 3: mump2p (RLNC)
     compose_dir = os.path.join(outdir, "optimum")
     os.makedirs(compose_dir, exist_ok=True)
+    lan_opt = pick_random_docker_lan_octet()
+    print(f"  Docker bench LAN (optimum): 172.{lan_opt}.0.0/16")
     opt_compose = generate(
         n_nodes, "optimum", peer_id, compose_dir,
         latencies=latencies, bandwidth_mbit=bandwidth,
-        lan_second_octet=lan_octet,
+        lan_second_octet=lan_opt,
     )
     r_opt = run_p2p_phase(
         "optimum", n_nodes, msg_size, count,
         opt_compose, client_dir, ips_file, outdir,
         latencies=latencies, bandwidth_mbit=bandwidth,
-        lan_second_octet=lan_octet,
+        lan_second_octet=lan_opt,
     )
     results.append(r_opt)
 
@@ -804,8 +847,6 @@ def mode_sweep(args):
     ensure_identity()
     client_dir = ensure_client_binaries()
     ips_file = write_ips_file(n_nodes, outdir)
-    lan_octet = pick_docker_lan_second_octet(outdir)
-    print(f"  Docker bench LAN: 172.{lan_octet}.0.0/16 (derived from output dir)")
 
     all_results = []
 
@@ -813,6 +854,8 @@ def mode_sweep(args):
         print(f"\n  ═══ Shard factor = {sf} ═══")
         compose_dir = os.path.join(outdir, f"sf{sf}")
         os.makedirs(compose_dir, exist_ok=True)
+        lan_octet = pick_random_docker_lan_octet()
+        print(f"  Docker bench LAN (optimum sf={sf}): 172.{lan_octet}.0.0/16")
 
         opt_compose = generate(
             n_nodes, "optimum", peer_id, compose_dir,

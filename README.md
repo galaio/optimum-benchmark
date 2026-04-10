@@ -180,7 +180,7 @@ The first message in each phase can show inflated spread while the mesh finishes
 ### 8. Large message + WAN latency combination failure
 With emulated WAN (`--latency` not `off`), p2pnode rc16 often delivers **nothing** for GossipSub/mump2p if the payload is too large (often above ~32KB). **`benchmark.py` auto-caps MsgSize to 32KB when tc latency is active** so compare/sweep get non-empty traces. For full-size payloads without that limit, run with `--latency off` (or pass an explicit `--msg-size` at or below 32kb under WAN).
 
-Under WAN, **`tc netem` uses `limit 50000`** (instead of the kernel default 1000 packets) to reduce tail drops on bursty pubsub, and **`run_test.sh` gets longer mesh / GRAFT / per-round waits** unless you override `BENCH_MESH_STABILIZE_SECS`, `BENCH_TOPIC_GRAFT_WAIT_SECS`, or `BENCH_PER_ROUND_WAIT_SECS`.
+Under WAN, **`tc netem` uses `limit 50000`** (instead of the kernel default 1000 packets) to reduce tail drops on bursty pubsub, and **`run_test.sh` gets longer mesh / GRAFT / per-round waits** plus a **longer final drain** (`BENCH_FINAL_DRAIN_SECS`, default 45s under WAN) so the last publishes are not cut off while still on the wire. Override with `BENCH_MESH_STABILIZE_SECS`, `BENCH_TOPIC_GRAFT_WAIT_SECS`, `BENCH_PER_ROUND_WAIT_SECS`, or `BENCH_FINAL_DRAIN_SECS` if needed.
 
 ### 9. Network latency simulation requires a native Linux host
 `--latency` relies on the Linux kernel's `tc netem` (traffic control) to inject network delay into container network namespaces via `nsenter`. This does **not** work on:

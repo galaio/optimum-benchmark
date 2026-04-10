@@ -168,12 +168,15 @@ def p2p_subprocess_env(n_nodes: int, latencies: list[int] | None) -> dict[str, s
     env = os.environ.copy()
     if not latencies:
         return env
-    # Default per-round wait is 8+N*3; under WAN use at least 12+N*5 so large frames clear the mesh.
+    # Default per-round wait is 8+N*3; under WAN use longer spacing so the slowest paths finish
+    # before the next publish (rc16 still often loses rounds if we cut this too tight).
     lan_wait = 8 + n_nodes * 3
-    wan_wait = 12 + n_nodes * 5
+    wan_wait = 15 + n_nodes * 7
     env.setdefault("BENCH_PER_ROUND_WAIT_SECS", str(max(lan_wait, wan_wait)))
-    env.setdefault("BENCH_MESH_STABILIZE_SECS", "28")
-    env.setdefault("BENCH_TOPIC_GRAFT_WAIT_SECS", "28")
+    env.setdefault("BENCH_MESH_STABILIZE_SECS", "32")
+    env.setdefault("BENCH_TOPIC_GRAFT_WAIT_SECS", "32")
+    # Last rounds may still be in flight when the loop ends; 10s was too short under netem.
+    env.setdefault("BENCH_FINAL_DRAIN_SECS", "45")
     return env
 
 
@@ -770,7 +773,8 @@ def run_p2p_phase(
         # Per-round settle + health/mesh waits — allow headroom (WAN uses longer defaults).
         run_timeout = max(900, 300 + count * 50)
         if latencies:
-            run_timeout = max(1400, 420 + count * 95)
+            # ~71s/round * count + mesh/graft + drain — keep a margin above subprocess timeout.
+            run_timeout = max(1800, 520 + count * 115)
         subprocess.run(
             [
                 "bash", run_test_sh,

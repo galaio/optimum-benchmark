@@ -196,6 +196,51 @@ def pick_random_docker_lan_octet() -> int:
 
 # ─── Docker helpers ──────────────────────────────────────────────────────────
 
+def docker_cleanup_bench_leftovers() -> None:
+    """Remove containers matching name=bench-* and prune unused networks.
+
+    Same intent as:
+      docker ps -a --filter name=bench- -q | xargs -r docker rm -f
+      docker network prune -f
+    Implemented in Python so macOS (no ``xargs -r``) and Linux both work.
+    """
+    try:
+        ls = subprocess.run(
+            ["docker", "ps", "-a", "--filter", "name=bench-", "-q"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
+    if ls.returncode != 0:
+        return
+    ids = [line.strip() for line in ls.stdout.splitlines() if line.strip()]
+    removed = 0
+    if ids:
+        rm = subprocess.run(
+            ["docker", "rm", "-f", *ids],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if rm.returncode == 0:
+            removed = len(ids)
+        else:
+            err = (rm.stderr or rm.stdout or "").strip()
+            print(f"  {YELLOW}Docker cleanup: docker rm -f failed ({err}){NC}")
+    subprocess.run(
+        ["docker", "network", "prune", "-f"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if removed:
+        print(f"  Docker cleanup: removed {removed} bench-* container(s); pruned unused networks")
+    else:
+        print("  Docker cleanup: pruned unused Docker networks (no bench-* containers found)")
+
+
 def docker_compose_up(compose_file: str, project_name: str):
     print(f"\n{'='*60}")
     print(f"  Starting cluster: {project_name}")
@@ -720,6 +765,7 @@ def mode_compare(args):
     print(f"  Output: {outdir}")
     print(f"{'='*60}")
 
+    docker_cleanup_bench_leftovers()
     ensure_identity()
     client_dir = ensure_client_binaries()
     ips_file = write_ips_file(n_nodes, outdir)
@@ -844,6 +890,7 @@ def mode_sweep(args):
     print(f"  Output: {outdir}")
     print(f"{'='*60}")
 
+    docker_cleanup_bench_leftovers()
     ensure_identity()
     client_dir = ensure_client_binaries()
     ips_file = write_ips_file(n_nodes, outdir)
